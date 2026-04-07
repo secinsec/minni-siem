@@ -1,0 +1,258 @@
+import json
+import sys
+import os
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from configparser import ConfigParser
+
+from parser.normalizer import LogNormalizer
+from parser.windows_parser import WindowsEventParser
+from mapping.mitre_mapper import MitreMapper
+from detectors.detection_engine import DetectionEngine
+from detectors.advanced_detectors import ImpossibleTravelDetector, ExternalIPRateDetector, AnomalyDetector
+
+
+class MiniSIEM:
+    def __init__(self, config_path: Optional[str] = None):
+        self.config = self._load_config(config_path)
+        
+        self.normalizer = LogNormalizer()
+        self.parser = WindowsEventParser(self.normalizer)
+        self.mitre_mapper = MitreMapper()
+        
+        detection_config = self.config.get("detection", {})
+        self.detection_engine = DetectionEngine(detection_config)
+        self.impossible_travel_detector = ImpossibleTravelDetector(detection_config)
+        self.external_ip_detector = ExternalIPRateDetector(detection_config)
+        self.anomaly_detector = AnomalyDetector(detection_config)
+        
+        self.events = []
+        self.detections = []
+        self.alerts = []
+
+    def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
+        config = ConfigParser()
+        
+        default_config = {
+            "detection": {
+                "brute_force_threshold": 5,
+                "impossible_travel_threshold_km": 500,
+                "impossible_travel_time_window_hours": 2,
+                "external_ip_rate_limit": 100,
+                "failed_login_window_minutes": 10
+            },
+            "siem": {
+                "log_level": "INFO",
+                "output_format": "json",
+                "alert_severity_threshold": "MEDIUM"
+            }
+        }
+        
+        if config_path and os.path.exists(config_path):
+            config.read(config_path)
+            for section in config.sections():
+                if section not in default_config:
+                    default_config[section] = {}
+                for key, value in config.items(section):
+                    if key in ["brute_force_threshold", "impossible_travel_threshold_km",
+                              "impossible_travel_time_window_hours", "external_ip_rate_limit",
+                              "failed_login_window_minutes"]:
+                        default_config[section][key] = int(value)
+                    elif key in ["log_level", "output_format", "alert_severity_threshold"]:
+                        default_config[section][key] = value
+        
+        return default_config
+
+    def load_logs(self, log_path: str, format_type: Optional[str] = None) -> int:
+        if os.path.isdir(log_path):
+            self.events = self.parser.parse_directory(log_path)
+        else:
+            self.events = self.parser.parse_file(log_path, format_type)
+        
+        return len(self.events)
+
+    def analyze(self) -> List[Dict[str, Any]]:
+        self.detections = []
+        
+        basic_detections = self.detection_engine.detect(self.events)
+        self.detections.extend(basic_detections)
+        
+        travel_detections = self.impossible_travel_detector.detect(self.events)
+        self.detections.extend(travel_detections)
+        
+        rate_detections = self.external_ip_detector.detect(self.events)
+        self.detections.extend(rate_detections)
+        
+        anomaly_detections = self.anomaly_detector.detect(self.events)
+        self.detections.extend(anomaly_detections)
+        
+        for detection in self.detections:
+            self._enrich_with_mitre(detection)
+        
+        return self.detections
+
+    def _enrich_with_mitre(self, detection: Dict[str, Any]):
+        detection_type = detection.get("detection_type", "")
+        
+        related_event = detection.get("related_event")
+        if related_event:
+            techniques = self.mitre_mapper.map_detection(detection_type, related_event)
+        else:
+            techniques = self.mitre_mapper.map_detection(detection_type, {})
+        
+        detection["mitre_techniques"] = techniques
+        
+        tags = detection.get("tags", [])
+        tags.extend([t["technique_id"] for t in techniques])
+        detection["tags"] = list(set(tags))
+
+    def generate_alerts(self) -> List[Dict[str, Any]]:
+        severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+        threshold = self.config.get("siem", {}).get("alert_severity_threshold", "MEDIUM")
+        threshold_level = severity_order.get(threshold, 1)
+        
+        self.alerts = []
+        
+        for detection in self.detections:
+            severity_level = severity_order.get(detection.get("severity", "MEDIUM"), 1)
+            if severity_level >= threshold_level:
+                alert = {
+                    "alert_id": f"ALERT-{len(self.alerts) + 1:04d}",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "detection_type": detection.get("detection_type", ""),
+                    "severity": detection.get("severity", "MEDIUM"),
+                    "title": detection.get("title", ""),
+                    "description": detection.get("description", ""),
+                    "risk_score": detection.get("risk_score", 0),
+                    "tags": detection.get("tags", []),
+                    "mitre_techniques": detection.get("mitre_techniques", []),
+                    "source_ip": detection.get("source_ip", ""),
+                    "username": detection.get("username") or detection.get("target_username") or "",
+                    "related_event": detection.get("related_event", {})
+                }
+                self.alerts.append(alert)
+        
+        return self.alerts
+
+    def export_json(self, output_path: str) -> None:
+        output = {
+            "siem_name": "Mini SIEM",
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "events_analyzed": len(self.events),
+            "total_detections": len(self.detections),
+            "alerts_generated": len(self.alerts),
+            "events": self.events[:100],
+            "detections": self.detections,
+            "alerts": self.alerts
+        }
+        
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=2)
+
+    def export_csv(self, output_path: str) -> None:
+        import csv
+        
+        with open(output_path, 'w', newline='') as f:
+            if not self.alerts:
+                return
+            
+            fieldnames = ["alert_id", "timestamp", "severity", "detection_type", 
+                         "title", "risk_score", "source_ip", "username"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for alert in self.alerts:
+                row = {k: alert.get(k, "") for k in fieldnames}
+                writer.writerow(row)
+
+    def print_summary(self) -> None:
+        print("\n" + "=" * 60)
+        print("MINI SIEM - ANALYSIS SUMMARY")
+        print("=" * 60)
+        print(f"Events Analyzed: {len(self.events)}")
+        print(f"Total Detections: {len(self.detections)}")
+        print(f"Alerts Generated: {len(self.alerts)}")
+        print()
+        
+        severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for detection in self.detections:
+            sev = detection.get("severity", "MEDIUM")
+            if sev in severity_counts:
+                severity_counts[sev] += 1
+        
+        print("Severity Breakdown:")
+        print(f"  HIGH:   {severity_counts['HIGH']}")
+        print(f"  MEDIUM: {severity_counts['MEDIUM']}")
+        print(f"  LOW:    {severity_counts['LOW']}")
+        print()
+        
+        detection_types = {}
+        for detection in self.detections:
+            dt = detection.get("detection_type", "unknown")
+            detection_types[dt] = detection_types.get(dt, 0) + 1
+        
+        print("Detection Types:")
+        for dt, count in sorted(detection_types.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {dt}: {count}")
+        
+        print("\n" + "=" * 60)
+        print("ALERTS")
+        print("=" * 60)
+        
+        for alert in self.alerts:
+            severity_icons = {"LOW": "[+]", "MEDIUM": "[!]", "HIGH": "[!!]", "CRITICAL": "[!!!]"}
+            icon = severity_icons.get(alert["severity"], "[*]")
+            print(f"\n{icon} [{alert['severity']}] {alert['title']}")
+            print(f"    {alert['description']}")
+            if alert.get("username"):
+                print(f"    User: {alert['username']}")
+            if alert.get("source_ip"):
+                print(f"    Source IP: {alert['source_ip']}")
+            if alert.get("mitre_techniques"):
+                techniques = [t["technique_id"] for t in alert["mitre_techniques"]]
+                print(f"    MITRE: {', '.join(techniques)}")
+            if alert.get("tags"):
+                print(f"    Tags: {', '.join(alert['tags'][:5])}")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Mini SIEM - Security Event Analyzer")
+    parser.add_argument("input", help="Log file or directory path")
+    parser.add_argument("-c", "--config", help="Config file path")
+    parser.add_argument("-o", "--output", help="Output JSON file path")
+    parser.add_argument("--format", choices=["evtx", "csv", "txt", "json"], 
+                       help="Input log format")
+    parser.add_argument("--csv", action="store_true", help="Export alerts to CSV")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    
+    args = parser.parse_args()
+    
+    siem = MiniSIEM(args.config)
+    
+    print(f"Loading logs from: {args.input}")
+    event_count = siem.load_logs(args.input, args.format)
+    print(f"Loaded {event_count} events")
+    
+    print("Analyzing events...")
+    detections = siem.analyze()
+    print(f"Found {len(detections)} detections")
+    
+    alerts = siem.generate_alerts()
+    print(f"Generated {len(alerts)} alerts")
+    
+    siem.print_summary()
+    
+    if args.output:
+        siem.export_json(args.output)
+        print(f"\nExported to: {args.output}")
+    
+    if args.csv:
+        csv_path = args.output.replace(".json", ".csv") if args.output else "alerts.csv"
+        siem.export_csv(csv_path)
+        print(f"CSV exported to: {csv_path}")
+
+
+if __name__ == "__main__":
+    main()
